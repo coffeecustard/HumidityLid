@@ -1,0 +1,11 @@
+WIFI_SSID = "your-wifi-ssid"
+WIFI_PASSWORD = "your-wifi-password"
+TIMEZONE_OFFSET = -4
+
+INFLUXDB_HOST = "http://your-nas-ip:8086"
+INFLUXDB_TOKEN = "your-token-here"
+INFLUXDB_ORG = "your-org-id"
+INFLUXDB_BUCKET = "humidity"
+
+NTFY_HOST = "http://your-nas-ip:8088"
+NTFY_TOPIC = "filament-humidity-monitor"
