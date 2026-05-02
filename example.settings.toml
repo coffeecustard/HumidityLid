@@ -1,5 +1,7 @@
 WIFI_SSID = "your-wifi-ssid"
 WIFI_PASSWORD = "your-wifi-password"
+
+# adjust based on your actual location
 TIMEZONE_OFFSET = -4
 
 INFLUXDB_HOST = "http://your-nas-ip:8086"
