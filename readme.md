@@ -55,7 +55,7 @@ A low-power IoT sensor that monitors humidity inside a sealed filament storage b
 
 ## Configuration
 
-Copy `settings.toml.example` to `settings.toml` and fill in your credentials. This file is excluded from version control.
+Copy `example.settings.toml` to `settings.toml` and fill in your credentials. This file is excluded from version control.
 
 ```toml
 WIFI_SSID = "your-wifi-ssid"
