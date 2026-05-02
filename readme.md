@@ -9,8 +9,8 @@ A low-power IoT sensor that monitors humidity inside a sealed filament storage b
 | [Adafruit ESP32-C6 Feather - STEMMA QT](https://www.adafruit.com/product/5933) | Main microcontroller with WiFi 6, Bluetooth 5, and built-in LiPo charging and monitoring |
 | [Adafruit AHT20 - Temperature & Humidity Sensor Breakout Board - STEMMA QT](https://www.adafruit.com/product/4566) | I2C temperature and humidity sensor |
 | [STEMMA QT / Qwiic JST SH 4-Pin Cable - 50mm](https://www.adafruit.com/product/4399) | Connects AHT20 to Feather without soldering |
-| Diffused Red/Green Indicator LED - 18mm Round | Dual color LED for local status indication (common cathode) |
-| Adafruit LiPo Battery 2500mAh | Powers the board during battery operation |
+| [Diffused Red/Green Indicator LED - 18mm Round] (https://www.adafruit.com/product/4042) | Dual color LED for local status indication (common cathode) |
+| [Adafruit LiPo Battery 2500mAh] (https://www.adafruit.com/product/328) | Powers the board during battery operation |
 | Panel mount momentary pushbutton | Wakes the board and triggers LED status display |
 | 2x 80Ω resistors | Current limiting resistors for the LED |
 
@@ -50,8 +50,8 @@ A low-power IoT sensor that monitors humidity inside a sealed filament storage b
 
 ## Infrastructure
 
-- **InfluxDB 2.8.0** — time series database running in Docker on Synology NAS
-- **ntfy** — self-hosted push notification service running in Docker on Synology NAS
+- **InfluxDB 2.8.0** — time series database running in Docker
+- **ntfy** — self-hosted push notification service running in Docker
 
 ## Configuration
 
