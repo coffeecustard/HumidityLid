@@ -8,4 +8,4 @@ INFLUXDB_ORG = "your-org-id"
 INFLUXDB_BUCKET = "humidity"
 
 NTFY_HOST = "http://your-nas-ip:8088"
-NTFY_TOPIC = "filament-humidity-monitor"
+NTFY_TOPIC = "humiditylid"
