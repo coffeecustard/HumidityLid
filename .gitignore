@@ -1,0 +1,16 @@
+# CircuitPython settings and secrets
+settings.toml
+
+# CircuitPython system files
+boot_out.txt
+.Trashes
+.fseventsd
+.Spotlight-V100
+
+# State and buffer files
+state.json
+buffer.json
+error.log
+
+# Mac system files
+.DS_Store
