@@ -12,6 +12,7 @@ import adafruit_requests
 import adafruit_ntp
 import rtc
 import alarm
+from microcontroller import watchdog as w
 
 # =========================================================
 # CONFIGURATION
@@ -34,7 +35,7 @@ BUFFER_FILE = "/buffer.json"
 ERROR_LOG = "/error.log"
 BATTERY_CHECK_INTERVAL = 86400
 LED_ON_SECONDS = 5
-MAX_ERROR_LOG_BYTES = 10240  # 10KB cap on error log
+MAX_ERROR_LOG_BYTES = 10240
 
 # Humidity alert thresholds
 LEVEL_WATCH = 15.0
@@ -76,15 +77,13 @@ MAX_INTERVAL_CRITICAL = 1800
 
 def log_error(message):
     try:
-        # Check file size and rotate if needed
         try:
-            import os
-            size = os.stat(ERROR_LOG)[6]
+            import os as _os
+            size = _os.stat(ERROR_LOG)[6]
             if size > MAX_ERROR_LOG_BYTES:
-                os.remove(ERROR_LOG)
+                _os.remove(ERROR_LOG)
         except Exception:
             pass
-
         with open(ERROR_LOG, "a") as f:
             t = time.localtime()
             timestamp = f"{t.tm_year}-{t.tm_mon:02d}-{t.tm_mday:02d} {t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
@@ -110,14 +109,14 @@ def save_buffer(buffer):
     except Exception as e:
         log_error(f"Could not save buffer: {e}")
 
-def add_to_buffer(temp, humidity, battery_pct, battery_voltage, timestamp):
+def add_to_buffer(temp, humidity, battery_pct, battery_voltage, monotonic):
     buffer = load_buffer()
     buffer.append({
         "temp": temp,
         "humidity": humidity,
         "battery_pct": battery_pct,
         "battery_voltage": battery_voltage,
-        "timestamp": timestamp
+        "monotonic": monotonic
     })
     save_buffer(buffer)
     print(f"Buffered reading — {len(buffer)} entries pending")
@@ -131,7 +130,7 @@ def flush_buffer(session, ntp_time, monotonic_at_sync):
     failed = []
 
     for entry in buffer:
-        # Calculate actual timestamp using monotonic offset
+        w.feed()
         monotonic_offset = monotonic_at_sync - entry.get("monotonic", monotonic_at_sync)
         actual_timestamp = int(ntp_time - monotonic_offset)
 
@@ -430,6 +429,9 @@ def handle_battery_alerts(session, battery_pct, now, state):
 # MAIN
 # =========================================================
 
+# Feed watchdog immediately on wake
+w.feed()
+
 state = load_state()
 
 # Check what woke us up
@@ -440,6 +442,7 @@ print("Wake reason:", "button press" if button_wake else "timer")
 sensor = adafruit_ahtx0.AHTx0(board.I2C())
 battery = adafruit_max1704x.MAX17048(board.I2C())
 print("Sensors initialized")
+w.feed()
 
 # Read humidity always
 temp = sensor.temperature
@@ -474,6 +477,8 @@ except Exception as e:
     log_error(f"WiFi connection failed: {e}")
     print(f"WiFi failed: {e}")
 
+w.feed()
+
 # NTP sync
 now = None
 monotonic_at_sync = None
@@ -490,6 +495,8 @@ if wifi_connected:
         log_error(f"NTP sync failed: {e}")
         print(f"NTP failed: {e}")
         wifi_connected = False
+
+w.feed()
 
 # Read battery if due
 battery_pct = None
@@ -532,12 +539,11 @@ elif last_log_time and now and (now - last_log_time) >= 86400:
 else:
     print("No significant change — skipping")
 
+w.feed()
+
 if should_log or needs_battery_check:
     if wifi_connected and now:
-        # Flush any buffered readings first
         flush_buffer(session, now, monotonic_at_sync)
-
-        # Log current reading
         success = log_to_influxdb(session, temp, humidity, now, battery_pct, battery_voltage)
         if success:
             state["last_humidity"] = humidity
@@ -546,10 +552,11 @@ if should_log or needs_battery_check:
             log_error("InfluxDB write failed, buffering reading")
             add_to_buffer(temp, humidity, battery_pct, battery_voltage, monotonic_now)
     else:
-        # Offline — buffer the reading
         print("Offline — buffering reading")
         add_to_buffer(temp, humidity, battery_pct, battery_voltage, monotonic_now)
         state["last_humidity"] = humidity
+
+w.feed()
 
 # Update adaptive interval
 sleep_seconds = update_interval(state, humidity, significant_change)
@@ -560,6 +567,8 @@ if wifi_connected and session and now:
     handle_humidity_alerts(session, humidity, now, state)
     if needs_battery_check and battery_pct is not None:
         handle_battery_alerts(session, battery_pct, now, state)
+
+w.feed()
 
 # Save state
 save_state(state)
