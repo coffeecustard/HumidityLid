@@ -1,5 +1,6 @@
-# CircuitPython settings and secrets
+# Settings and secrets
 settings.toml
+config.h
 
 # CircuitPython system files
 boot_out.txt
