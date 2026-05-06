@@ -1,0 +1,18 @@
+#pragma once
+
+// WiFi
+#define WIFI_SSID "your-wifi-ssid"
+#define WIFI_PASSWORD "your-wifi-password"
+
+// Time
+#define TIMEZONE_OFFSET -4
+
+// InfluxDB
+#define INFLUXDB_HOST "http://your-nas-ip:8086"
+#define INFLUXDB_TOKEN "your-token-here"
+#define INFLUXDB_ORG "your-org-id"
+#define INFLUXDB_BUCKET "humidity"
+
+// ntfy
+#define NTFY_HOST "http://your-nas-ip:8088"
+#define NTFY_TOPIC "filament-humidity-monitor"
