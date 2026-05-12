@@ -37,7 +37,7 @@ static const float BATTERY_EMERGENCY = 5.0f;
 static const uint32_t BATTERY_ALERT_INTERVAL_CRITICAL  = 86400UL;
 static const uint32_t BATTERY_ALERT_INTERVAL_EMERGENCY = 1800UL;
 
-static const uint32_t INTERVAL_LADDER[] = { 1800, 3600, 7200, 21600, 43200 };
+static const uint32_t INTERVAL_LADDER[] = { 1800, 3600, 10800, 21600, 43200 };
 static const size_t   INTERVAL_LADDER_LEN = sizeof(INTERVAL_LADDER) / sizeof(INTERVAL_LADDER[0]);
 static const uint8_t  STABLE_READINGS_TO_STEP_UP = 3;
 
@@ -240,10 +240,10 @@ static uint32_t getMaxInterval(float humidity) {
   return MAX_INTERVAL_BELOW_WATCH;
 }
 
-static float getThreshold(float humidity) {
-  if (humidity < LEVEL_WATCH)    return 2.0f;
-  if (humidity < LEVEL_WARNING)  return 1.0f;
-  if (humidity < LEVEL_CRITICAL) return 0.5f;
+static float getThreshold(float baseline) {
+  if (baseline < LEVEL_WATCH)    return 2.0f;
+  if (baseline < LEVEL_WARNING)  return 1.0f;
+  if (baseline < LEVEL_CRITICAL) return 0.5f;
   return 0.0f;
 }
 
@@ -456,40 +456,30 @@ void setup() {
     if (!timeOk) wifiOk = false;
   }
 
-  float threshold        = getThreshold(humidity);
+  float threshold         = g_state.has_humidity ? getThreshold(g_state.last_humidity) : 0.0f;
   bool  significantChange = false;
-  bool  shouldLog         = false;
 
-  if (!g_state.has_humidity) {
-    shouldLog = true;
-  } else if (threshold == 0.0f) {
-    shouldLog = true; significantChange = true;
-  } else if (fabsf(humidity - g_state.last_humidity) >= threshold) {
-    shouldLog = true; significantChange = true;
-  } else if (g_state.last_log_time && timeOk && (uint32_t)((uint32_t)unixNow - g_state.last_log_time) >= 86400UL) {
-    shouldLog = true;
+  if (g_state.has_humidity) {
+    if (threshold == 0.0f || fabsf(humidity - g_state.last_humidity) >= threshold) {
+      significantChange = true;
+    }
   }
 
   bool logged = false;
-  if (shouldLog) {
-    if (wifiOk && timeOk) {
-      flushBuffer(unixNow, monoAtSyncMs);
-      bool ok = postInflux(buildInfluxBody(temp, humidity, unixNow, batPct, batV));
-      if (ok) {
-        logged                 = true;
-        g_state.last_humidity  = humidity;
-        g_state.has_humidity   = true;
-        g_state.last_log_time  = (uint32_t)unixNow;
-      } else {
-        logError("InfluxDB write failed, buffering reading");
-        addToBuffer(temp, humidity, batPct, batV, monoNow);
-      }
+  if (wifiOk && timeOk) {
+    flushBuffer(unixNow, monoAtSyncMs);
+    if (postInflux(buildInfluxBody(temp, humidity, unixNow, batPct, batV))) {
+      logged                = true;
+      g_state.last_log_time = (uint32_t)unixNow;
     } else {
+      logError("InfluxDB write failed, buffering reading");
       addToBuffer(temp, humidity, batPct, batV, monoNow);
-      g_state.last_humidity = humidity;
-      g_state.has_humidity  = true;
     }
+  } else {
+    addToBuffer(temp, humidity, batPct, batV, monoNow);
   }
+  g_state.last_humidity = humidity;
+  g_state.has_humidity  = true;
 
   uint32_t sleepSeconds = updateInterval(humidity, significantChange);
 
@@ -498,10 +488,11 @@ void setup() {
     handleBatteryAlerts(batPct, unixNow);
   }
 
-  Serial.printf("Boot #%u | %.1fC | Hum: %.1f%% | Bat: %.0f%% %.2fV | WiFi: %s | Logged: %s | Sleep: %umin\n",
+  Serial.printf("Boot #%u | %.1fC | Hum: %.1f%% | Bat: %.0f%% %.2fV | WiFi: %s | Logged: %s | Stable: %u | Sleep: %umin\n",
     bootCount, temp, humidity, batPct, batV,
     wifiOk ? "ok" : "fail",
     logged  ? "yes" : "no",
+    (unsigned)g_state.consecutive_stable,
     (unsigned)(sleepSeconds / 60));
 
   enterDeepSleep(sleepSeconds);
