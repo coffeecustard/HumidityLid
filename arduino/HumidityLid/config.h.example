@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef ARDUINO_USB_CDC_ON_BOOT
+  #define ARDUINO_USB_CDC_ON_BOOT 1
+#endif
+
 // WiFi
 #define WIFI_SSID "your-wifi-ssid"
 #define WIFI_PASSWORD "your-wifi-password"
