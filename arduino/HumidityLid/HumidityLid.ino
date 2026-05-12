@@ -3,11 +3,9 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <LittleFS.h>
-#include <ArduinoJson.h>
 #include <Adafruit_AHTX0.h>
 #include <SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library.h>
 #include <esp_sleep.h>
-#include <esp_task_wdt.h>
 #include <esp_bt.h>
 #include <time.h>
 #include <math.h>
@@ -15,16 +13,14 @@
 #include "config.h"
 
 // =========================================================
-// CONSTANTS (mirror CircuitPython reference)
+// CONSTANTS
 // =========================================================
 
-static const char* STATE_FILE  = "/state.json";
-static const char* BUFFER_FILE = "/buffer.json";
+static const char* BUFFER_FILE = "/buf.bin";
 static const char* ERROR_LOG   = "/error.log";
 
-static const uint32_t BATTERY_CHECK_INTERVAL = 86400;
-static const uint32_t LED_ON_SECONDS         = 5;
-static const size_t   MAX_ERROR_LOG_BYTES    = 10240;
+static const uint32_t LED_ON_SECONDS      = 5;
+static const size_t   MAX_ERROR_LOG_BYTES = 10240;
 
 static const float LEVEL_WATCH    = 15.0f;
 static const float LEVEL_WARNING  = 18.0f;
@@ -54,39 +50,48 @@ static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t NTP_SYNC_TIMEOUT_MS     = 15000;
 static const time_t   NTP_VALID_AFTER         = 1700000000;
 
-static const uint32_t WDT_TIMEOUT_MS = 300000;
+// =========================================================
+// RTC STATE
+// =========================================================
 
-#define DEBUG
-#ifdef DEBUG
-  #define DBG_BEGIN()    Serial.begin(115200)
-  #define DBG(...)       Serial.print(__VA_ARGS__)
-  #define DBGLN(...)     Serial.println(__VA_ARGS__)
-  #define DBGF(...)      Serial.printf(__VA_ARGS__)
-#else
-  #define DBG_BEGIN()
-  #define DBG(...)
-  #define DBGLN(...)
-  #define DBGF(...)
-#endif
+struct State {
+  float    last_humidity;
+  uint32_t last_log_time;       // 0 = never logged
+  uint32_t last_alert_time;     // 0 = never alerted
+  uint32_t last_bat_alert_time; // 0 = never alerted
+  uint32_t current_interval;
+  uint8_t  consecutive_stable;
+  uint8_t  hum_alert_level;    // 0=none 1=watch 2=warning 3=critical
+  uint8_t  bat_alert_level;    // 0=none 1=warning 2=critical 3=emergency
+  bool     watch_alert_sent;
+  bool     bat_warning_sent;
+  bool     has_humidity;        // last_humidity is valid
+};
+
+RTC_DATA_ATTR State    g_state      = {};
+RTC_DATA_ATTR bool     g_valid      = false;
+RTC_DATA_ATTR uint32_t bootCount    = 0;
+RTC_DATA_ATTR uint64_t persistentUs = 0;
+
+// =========================================================
+// BINARY BUFFER
+// =========================================================
+
+struct Reading {
+  float    temp, humidity, batPct, batV;
+  uint64_t monoMs;
+}; // 24 bytes
 
 // =========================================================
 // GLOBALS
 // =========================================================
 
-RTC_DATA_ATTR uint32_t bootCount = 0;
-RTC_DATA_ATTR uint64_t persistentUs = 0;  // accumulates across deep sleeps
-
 Adafruit_AHTX0 aht;
 SFE_MAX1704X   lipo(MAX1704X_MAX17048);
 
 // =========================================================
-// MONOTONIC CLOCK (survives deep sleep)
+// MONOTONIC CLOCK
 // =========================================================
-// persistentUs holds the total elapsed microseconds across all prior boot
-// cycles + sleep durations. esp_timer_get_time() gives us the current
-// boot's elapsed microseconds. Their sum is a monotonic counter that
-// survives deep sleep (zeroes on cold boot / brownout — same caveat as
-// the CircuitPython reference).
 
 static uint64_t monotonicMs() {
   return (persistentUs + (uint64_t)esp_timer_get_time()) / 1000ULL;
@@ -97,20 +102,15 @@ static uint64_t monotonicMs() {
 // =========================================================
 
 static void logError(const String& msg) {
+  Serial.println("ERROR: " + msg);
   if (LittleFS.exists(ERROR_LOG)) {
     File f = LittleFS.open(ERROR_LOG, "r");
-    size_t sz = f ? f.size() : 0;
+    bool tooBig = f && f.size() > MAX_ERROR_LOG_BYTES;
     if (f) f.close();
-    if (sz > MAX_ERROR_LOG_BYTES) {
-      LittleFS.remove(ERROR_LOG);
-    }
+    if (tooBig) LittleFS.remove(ERROR_LOG);
   }
   File f = LittleFS.open(ERROR_LOG, "a");
-  if (!f) {
-    DBG("Could not write to error log: ");
-    DBGLN(msg);
-    return;
-  }
+  if (!f) return;
   char ts[24];
   time_t now = time(nullptr);
   struct tm tmv;
@@ -121,98 +121,15 @@ static void logError(const String& msg) {
 }
 
 // =========================================================
-// STATE
-// =========================================================
-
-static void stateDefaults(JsonDocument& state) {
-  state["last_humidity"]            = nullptr;
-  state["last_log_time"]            = nullptr;
-  state["last_alert_time"]          = nullptr;
-  state["alert_level"]              = nullptr;
-  state["watch_alert_sent"]         = false;
-  state["consecutive_stable"]       = 0;
-  state["current_interval"]         = INTERVAL_LADDER[0];
-  state["last_battery_check"]       = nullptr;
-  state["battery_warning_sent"]     = false;
-  state["last_battery_alert_time"]  = nullptr;
-  state["battery_alert_level"]      = nullptr;
-}
-
-static void loadState(JsonDocument& state) {
-  File f = LittleFS.open(STATE_FILE, "r");
-  if (!f) {
-    DBGLN("No state file, starting fresh");
-    stateDefaults(state);
-    return;
-  }
-  DeserializationError err = deserializeJson(state, f);
-  f.close();
-  if (err) {
-    DBG("State parse error: "); DBGLN(err.c_str());
-    state.clear();
-    stateDefaults(state);
-    return;
-  }
-  DBGLN("State loaded");
-}
-
-static void saveState(const JsonDocument& state) {
-  File f = LittleFS.open(STATE_FILE, "w");
-  if (!f) {
-    logError("Error saving state: open failed");
-    return;
-  }
-  if (serializeJson(state, f) == 0) {
-    logError("Error saving state: serialize failed");
-  }
-  f.close();
-}
-
-// =========================================================
 // BUFFER
 // =========================================================
 
-static void loadBuffer(JsonDocument& buf) {
-  buf.to<JsonArray>();
-  File f = LittleFS.open(BUFFER_FILE, "r");
-  if (!f) return;
-  DeserializationError err = deserializeJson(buf, f);
-  f.close();
-  if (err || !buf.is<JsonArray>()) {
-    buf.clear();
-    buf.to<JsonArray>();
-  }
-}
-
-static void saveBuffer(const JsonDocument& buf) {
-  File f = LittleFS.open(BUFFER_FILE, "w");
-  if (!f) {
-    logError("Could not save buffer: open failed");
-    return;
-  }
-  if (serializeJson(buf, f) == 0) {
-    logError("Could not save buffer: serialize failed");
-  }
-  f.close();
-}
-
 static void addToBuffer(float temp, float humidity, float batPct, float batV, uint64_t monoMs) {
-  JsonDocument buf;
-  loadBuffer(buf);
-  JsonArray arr = buf.as<JsonArray>();
-  JsonObject e = arr.add<JsonObject>();
-  e["temp"]     = temp;
-  e["humidity"] = humidity;
-  if (isnan(batPct)) {
-    e["battery_pct"]     = nullptr;
-    e["battery_voltage"] = nullptr;
-  } else {
-    e["battery_pct"]     = batPct;
-    e["battery_voltage"] = batV;
-  }
-  e["monotonic_ms"] = monoMs;
-  saveBuffer(buf);
-  DBGF("Buffered reading — %d entries pending\n", (int)arr.size());
+  File f = LittleFS.open(BUFFER_FILE, "a");
+  if (!f) { logError("buffer open failed"); return; }
+  Reading r = {temp, humidity, batPct, batV, monoMs};
+  f.write((uint8_t*)&r, sizeof(r));
+  f.close();
 }
 
 // =========================================================
@@ -220,100 +137,59 @@ static void addToBuffer(float temp, float humidity, float batPct, float batV, ui
 // =========================================================
 
 static String buildInfluxBody(float temp, float humidity, time_t ts, float batPct, float batV) {
-  String fields;
-  fields.reserve(128);
-  char tmp[32];
-  snprintf(tmp, sizeof(tmp), "temperature=%.2f,humidity=%.2f", temp, humidity);
-  fields += tmp;
-  if (!isnan(batPct)) {
-    snprintf(tmp, sizeof(tmp), ",battery_pct=%.1f,battery_voltage=%.2f", batPct, batV);
-    fields += tmp;
-  }
-  String body = "environment,location=bucket ";
-  body += fields;
-  body += ' ';
-  body += String((uint32_t)ts);
-  return body;
+  char tmp[128];
+  snprintf(tmp, sizeof(tmp),
+           "environment,location=bucket temperature=%.2f,humidity=%.2f,battery_pct=%.1f,battery_voltage=%.2f %lu",
+           temp, humidity, batPct, batV, (unsigned long)ts);
+  return String(tmp);
 }
 
 static bool postInflux(const String& body) {
-  String url = String(INFLUXDB_HOST) +
-               "/api/v2/write?org=" + INFLUXDB_ORG +
-               "&bucket=" + INFLUXDB_BUCKET +
-               "&precision=s";
+  String url = String(INFLUXDB_HOST)
+             + "/api/v2/write?org=" + INFLUXDB_ORG
+             + "&bucket=" + INFLUXDB_BUCKET
+             + "&precision=s";
   HTTPClient http;
   http.setReuse(false);
   http.setConnectTimeout(8000);
   http.setTimeout(8000);
-  if (!http.begin(url)) {
-    logError("InfluxDB error: http.begin failed");
-    return false;
-  }
+  if (!http.begin(url)) { logError("InfluxDB: http.begin failed"); return false; }
   http.addHeader("Authorization", String("Token ") + INFLUXDB_TOKEN);
   http.addHeader("Content-Type", "text/plain; charset=utf-8");
   int code = http.POST(body);
   http.end();
-  DBGF("InfluxDB: %d\n", code);
-  if (code < 0) {
-    logError(String("InfluxDB error: ") + HTTPClient::errorToString(code));
-    return false;
-  }
+  if (code < 0) { logError(String("InfluxDB error: ") + HTTPClient::errorToString(code)); return false; }
   return code == 204;
 }
 
-static bool logToInflux(float temp, float humidity, time_t ts, float batPct, float batV) {
-  return postInflux(buildInfluxBody(temp, humidity, ts, batPct, batV));
-}
-
 static bool flushBuffer(time_t unixNow, uint64_t monoAtSyncMs) {
-  JsonDocument buf;
-  loadBuffer(buf);
-  JsonArray arr = buf.as<JsonArray>();
-  if (arr.size() == 0) return true;
+  File f = LittleFS.open(BUFFER_FILE, "r");
+  if (!f) return true;
+  size_t n = f.size() / sizeof(Reading);
+  if (n == 0) { f.close(); return true; }
+  Serial.printf("Flushing %u buffered readings\n", (unsigned)n);
 
-  DBGF("Flushing %d buffered readings...\n", (int)arr.size());
+  Reading* readings = new Reading[n];
+  f.read((uint8_t*)readings, n * sizeof(Reading));
+  f.close();
 
-  JsonDocument failedDoc;
-  JsonArray failed = failedDoc.to<JsonArray>();
-
-  for (JsonObject e : arr) {
-    esp_task_wdt_reset();
-
-    uint64_t entryMs = e["monotonic_ms"] | monoAtSyncMs;
-    int64_t offsetMs = (int64_t)monoAtSyncMs - (int64_t)entryMs;
-    if (offsetMs < 0) offsetMs = 0;
-    time_t actualTs = (time_t)((int64_t)unixNow - offsetMs / 1000);
-
-    float temp     = e["temp"]     | NAN;
-    float humidity = e["humidity"] | NAN;
-    float batPct   = e["battery_pct"].isNull()     ? NAN : (float)e["battery_pct"];
-    float batV     = e["battery_voltage"].isNull() ? NAN : (float)e["battery_voltage"];
-
-    if (postInflux(buildInfluxBody(temp, humidity, actualTs, batPct, batV))) {
-      DBGF("Flushed entry at %ld\n", (long)actualTs);
-    } else {
-      DBGLN("Flush failed");
-      JsonObject keep = failed.add<JsonObject>();
-      keep["temp"]     = temp;
-      keep["humidity"] = humidity;
-      if (isnan(batPct)) {
-        keep["battery_pct"]     = nullptr;
-        keep["battery_voltage"] = nullptr;
-      } else {
-        keep["battery_pct"]     = batPct;
-        keep["battery_voltage"] = batV;
-      }
-      keep["monotonic_ms"] = entryMs;
-    }
+  size_t failures = 0;
+  for (size_t i = 0; i < n; i++) {
+    int64_t offMs = (int64_t)monoAtSyncMs - (int64_t)readings[i].monoMs;
+    if (offMs < 0) offMs = 0;
+    time_t ts = (time_t)((int64_t)unixNow - offMs / 1000LL);
+    if (!postInflux(buildInfluxBody(readings[i].temp, readings[i].humidity, ts, readings[i].batPct, readings[i].batV)))
+      readings[failures++] = readings[i];
   }
 
-  saveBuffer(failedDoc);
-  if (failed.size() == 0) {
-    DBGLN("Buffer fully flushed and cleared");
-    return true;
+  if (failures == 0) {
+    LittleFS.remove(BUFFER_FILE);
+  } else {
+    File fw = LittleFS.open(BUFFER_FILE, "w");
+    if (fw) { fw.write((uint8_t*)readings, failures * sizeof(Reading)); fw.close(); }
   }
-  DBGF("%d entries remain in buffer\n", (int)failed.size());
-  return false;
+  delete[] readings;
+  return failures == 0;
 }
 
 // =========================================================
@@ -326,22 +202,16 @@ static void sendAlert(const char* title, const String& message, const char* prio
   http.setReuse(false);
   http.setConnectTimeout(8000);
   http.setTimeout(8000);
-  if (!http.begin(url)) {
-    logError("ntfy error: http.begin failed");
-    return;
-  }
+  if (!http.begin(url)) { logError("ntfy: http.begin failed"); return; }
   http.addHeader("Title", title);
   http.addHeader("Priority", priority);
   int code = http.POST(message);
   http.end();
-  DBGF("ntfy: %d\n", code);
-  if (code < 0) {
-    logError(String("ntfy error: ") + HTTPClient::errorToString(code));
-  }
+  if (code < 0) logError(String("ntfy error: ") + HTTPClient::errorToString(code));
 }
 
 // =========================================================
-// LEDS (common-cathode dual LED, drive HIGH to light)
+// LEDS
 // =========================================================
 
 static void setupLeds() {
@@ -352,13 +222,8 @@ static void setupLeds() {
 }
 
 static void showLedStatus(float humidity) {
-  digitalWrite(A0, LOW);
-  digitalWrite(A1, LOW);
-  if (humidity >= LEVEL_WATCH) {
-    digitalWrite(A0, HIGH); // red
-  } else {
-    digitalWrite(A1, HIGH); // green
-  }
+  if (humidity >= LEVEL_WATCH) digitalWrite(A0, HIGH);
+  else                         digitalWrite(A1, HIGH);
   delay(LED_ON_SECONDS * 1000UL);
   digitalWrite(A0, LOW);
   digitalWrite(A1, LOW);
@@ -383,151 +248,103 @@ static float getThreshold(float humidity) {
 }
 
 static int ladderIndex(uint32_t interval) {
-  for (size_t i = 0; i < INTERVAL_LADDER_LEN; i++) {
+  for (size_t i = 0; i < INTERVAL_LADDER_LEN; i++)
     if (INTERVAL_LADDER[i] == interval) return (int)i;
-  }
   return -1;
 }
 
-static uint32_t updateInterval(JsonDocument& state, float humidity, bool significantChange) {
-  uint32_t maxInterval = getMaxInterval(humidity);
-
+static uint32_t updateInterval(float humidity, bool significantChange) {
   if (significantChange || humidity >= LEVEL_CRITICAL) {
-    state["current_interval"] = INTERVAL_LADDER[0];
-    state["consecutive_stable"] = 0;
+    g_state.current_interval   = INTERVAL_LADDER[0];
+    g_state.consecutive_stable = 0;
   } else {
-    int stable = (int)(state["consecutive_stable"] | 0) + 1;
-    state["consecutive_stable"] = stable;
+    int stable = (int)g_state.consecutive_stable + 1;
+    g_state.consecutive_stable = (uint8_t)stable;
     if (stable >= STABLE_READINGS_TO_STEP_UP) {
-      uint32_t current = state["current_interval"] | INTERVAL_LADDER[0];
-      int idx = ladderIndex(current);
-      if (idx >= 0 && idx < (int)INTERVAL_LADDER_LEN - 1) {
-        state["current_interval"] = INTERVAL_LADDER[idx + 1];
-      }
-      state["consecutive_stable"] = 0;
+      int idx = ladderIndex(g_state.current_interval);
+      if (idx >= 0 && idx < (int)INTERVAL_LADDER_LEN - 1)
+        g_state.current_interval = INTERVAL_LADDER[idx + 1];
+      g_state.consecutive_stable = 0;
     }
   }
-
-  uint32_t cur = state["current_interval"] | INTERVAL_LADDER[0];
-  if (cur > maxInterval) {
-    state["current_interval"] = maxInterval;
-    cur = maxInterval;
-  }
-  return cur;
+  uint32_t maxInterval = getMaxInterval(humidity);
+  if (g_state.current_interval > maxInterval)
+    g_state.current_interval = maxInterval;
+  return g_state.current_interval;
 }
 
 // =========================================================
-// HUMIDITY ALERTS
+// ALERTS
 // =========================================================
 
-static void handleHumidityAlerts(float humidity, time_t now, JsonDocument& state) {
-  const char* level = nullptr;
-  uint32_t alertInterval = 0;
-
-  if (humidity >= LEVEL_CRITICAL)      { level = "critical"; alertInterval = ALERT_INTERVAL_CRITICAL; }
-  else if (humidity >= LEVEL_WARNING)  { level = "warning";  alertInterval = ALERT_INTERVAL_WARNING; }
-  else if (humidity >= LEVEL_WATCH)    { level = "watch";    alertInterval = ALERT_INTERVAL_WATCH; }
-
-  if (level == nullptr) {
-    state["alert_level"]       = nullptr;
-    state["last_alert_time"]   = nullptr;
-    state["watch_alert_sent"]  = false;
-    return;
-  }
-
-  bool hasLast = !state["last_alert_time"].isNull();
-  time_t lastAlertTime = hasLast ? (time_t)(uint32_t)state["last_alert_time"] : 0;
-  bool watchSent = state["watch_alert_sent"] | false;
-
-  bool shouldAlert = false;
-  if (strcmp(level, "watch") == 0) {
-    if (!watchSent) {
-      shouldAlert = true;
-      state["watch_alert_sent"] = true;
-    } else if (hasLast && (uint32_t)(now - lastAlertTime) >= alertInterval) {
-      shouldAlert = true;
-    } else if (!hasLast) {
-      shouldAlert = true;
-    }
-  } else {
-    if (!hasLast || (uint32_t)(now - lastAlertTime) >= alertInterval) {
-      shouldAlert = true;
-    }
-  }
-
-  if (!shouldAlert) return;
-
-  char msg[160];
-  if (strcmp(level, "critical") == 0) {
-    snprintf(msg, sizeof(msg),
-             "Humidity is %.1f%% — above 20%% limit! Replace desiccant immediately.", humidity);
-    sendAlert("\xF0\x9F\x9A\xA8 Humidity Critical!", msg, "urgent");
-  } else if (strcmp(level, "warning") == 0) {
-    snprintf(msg, sizeof(msg),
-             "Humidity is %.1f%% — approaching limit. Replace desiccant soon.", humidity);
-    sendAlert("\xE2\x9A\xA0\xEF\xB8\x8F Humidity Warning", msg, "high");
-  } else {
-    snprintf(msg, sizeof(msg),
-             "Humidity is %.1f%% — monitor closely.", humidity);
-    sendAlert("\xF0\x9F\x91\x80 Humidity Rising", msg, "default");
-  }
-  state["last_alert_time"] = (uint32_t)now;
-  state["alert_level"]     = level;
+static bool isAlertDue(uint32_t lastTime, uint32_t interval, time_t now) {
+  return lastTime == 0 || (uint32_t)((uint32_t)now - lastTime) >= interval;
 }
 
-// =========================================================
-// BATTERY ALERTS
-// =========================================================
-
-static void handleBatteryAlerts(float batPct, time_t now, JsonDocument& state) {
-  const char* level = nullptr;
-  uint32_t alertInterval = 0;
-
-  if (batPct <= BATTERY_EMERGENCY)     { level = "emergency"; alertInterval = BATTERY_ALERT_INTERVAL_EMERGENCY; }
-  else if (batPct <= BATTERY_CRITICAL) { level = "critical";  alertInterval = BATTERY_ALERT_INTERVAL_CRITICAL; }
-  else if (batPct <= BATTERY_WARNING)  { level = "warning";   alertInterval = 0; }
-
-  if (level == nullptr) {
-    state["battery_warning_sent"]    = false;
-    state["last_battery_alert_time"] = nullptr;
-    state["battery_alert_level"]     = nullptr;
+static void handleHumidityAlerts(float hum, time_t now) {
+  if (hum < LEVEL_WATCH) {
+    g_state.hum_alert_level  = 0;
+    g_state.last_alert_time  = 0;
+    g_state.watch_alert_sent = false;
     return;
   }
 
-  bool hasLast = !state["last_battery_alert_time"].isNull();
-  time_t lastAlertTime = hasLast ? (time_t)(uint32_t)state["last_battery_alert_time"] : 0;
-  bool warningSent = state["battery_warning_sent"] | false;
+  char msg[160];
+  const char *title, *priority;
 
-  bool shouldAlert = false;
-  if (strcmp(level, "warning") == 0) {
-    if (!warningSent) {
-      shouldAlert = true;
-      state["battery_warning_sent"] = true;
-    }
+  if (hum >= LEVEL_CRITICAL) {
+    if (!isAlertDue(g_state.last_alert_time, ALERT_INTERVAL_CRITICAL, now)) return;
+    snprintf(msg, sizeof(msg), "Humidity is %.1f%% — above 20%% limit! Replace desiccant immediately.", hum);
+    title = "\xF0\x9F\x9A\xA8 Humidity Critical!"; priority = "urgent";
+    g_state.hum_alert_level = 3;
+  } else if (hum >= LEVEL_WARNING) {
+    if (!isAlertDue(g_state.last_alert_time, ALERT_INTERVAL_WARNING, now)) return;
+    snprintf(msg, sizeof(msg), "Humidity is %.1f%% — approaching limit. Replace desiccant soon.", hum);
+    title = "\xE2\x9A\xA0\xEF\xB8\x8F Humidity Warning"; priority = "high";
+    g_state.hum_alert_level = 2;
   } else {
-    if (!hasLast || (uint32_t)(now - lastAlertTime) >= alertInterval) {
-      shouldAlert = true;
-    }
+    if (g_state.watch_alert_sent && !isAlertDue(g_state.last_alert_time, ALERT_INTERVAL_WATCH, now)) return;
+    snprintf(msg, sizeof(msg), "Humidity is %.1f%% — monitor closely.", hum);
+    title = "\xF0\x9F\x91\x80 Humidity Rising"; priority = "default";
+    g_state.hum_alert_level  = 1;
+    g_state.watch_alert_sent = true;
   }
 
-  if (!shouldAlert) return;
+  sendAlert(title, msg, priority);
+  g_state.last_alert_time = (uint32_t)now;
+}
+
+static void handleBatteryAlerts(float batPct, time_t now) {
+  if (batPct > BATTERY_WARNING) {
+    g_state.bat_alert_level     = 0;
+    g_state.last_bat_alert_time = 0;
+    g_state.bat_warning_sent    = false;
+    return;
+  }
 
   char msg[160];
-  if (strcmp(level, "emergency") == 0) {
-    snprintf(msg, sizeof(msg),
-             "Battery at %.0f%% — device will shut down soon. Charge immediately.", batPct);
-    sendAlert("\xF0\x9F\x94\x8B Battery Emergency!", msg, "urgent");
-  } else if (strcmp(level, "critical") == 0) {
-    snprintf(msg, sizeof(msg),
-             "Battery at %.0f%% — please charge soon.", batPct);
-    sendAlert("\xF0\x9F\x94\x8B Battery Low", msg, "high");
+  const char *title, *priority;
+
+  if (batPct <= BATTERY_EMERGENCY) {
+    if (!isAlertDue(g_state.last_bat_alert_time, BATTERY_ALERT_INTERVAL_EMERGENCY, now)) return;
+    snprintf(msg, sizeof(msg), "Battery at %.0f%% — device will shut down soon. Charge immediately.", batPct);
+    title = "\xF0\x9F\x94\x8B Battery Emergency!"; priority = "urgent";
+    g_state.bat_alert_level = 3;
+  } else if (batPct <= BATTERY_CRITICAL) {
+    if (!isAlertDue(g_state.last_bat_alert_time, BATTERY_ALERT_INTERVAL_CRITICAL, now)) return;
+    snprintf(msg, sizeof(msg), "Battery at %.0f%% — please charge soon.", batPct);
+    title = "\xF0\x9F\x94\x8B Battery Low"; priority = "high";
+    g_state.bat_alert_level = 2;
   } else {
-    snprintf(msg, sizeof(msg),
-             "Battery at %.0f%% — consider charging.", batPct);
-    sendAlert("\xF0\x9F\x94\x8B Battery Warning", msg, "default");
+    if (g_state.bat_warning_sent) return;
+    snprintf(msg, sizeof(msg), "Battery at %.0f%% — consider charging.", batPct);
+    title = "\xF0\x9F\x94\x8B Battery Warning"; priority = "default";
+    g_state.bat_alert_level  = 1;
+    g_state.bat_warning_sent = true;
   }
-  state["last_battery_alert_time"] = (uint32_t)now;
-  state["battery_alert_level"]     = level;
+
+  sendAlert(title, msg, priority);
+  g_state.last_bat_alert_time = (uint32_t)now;
 }
 
 // =========================================================
@@ -538,21 +355,15 @@ static bool connectWifi() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(true);
-  DBG("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) {
-      DBGLN(" timeout");
       logError("WiFi connection failed: timeout");
       return false;
     }
     delay(200);
-    DBG('.');
-    esp_task_wdt_reset();
   }
-  DBG(" connected, IP: ");
-  DBGLN(WiFi.localIP());
   return true;
 }
 
@@ -562,9 +373,8 @@ static bool syncTime(time_t& unixNow, uint64_t& monoAtSyncMs) {
   while (true) {
     time_t t = time(nullptr);
     if (t > NTP_VALID_AFTER) {
-      unixNow = t;
+      unixNow      = t;
       monoAtSyncMs = monotonicMs();
-      DBGF("Time synced (UTC): %ld\n", (long)t);
       return true;
     }
     if (millis() - start > NTP_SYNC_TIMEOUT_MS) {
@@ -572,7 +382,6 @@ static bool syncTime(time_t& unixNow, uint64_t& monoAtSyncMs) {
       return false;
     }
     delay(250);
-    esp_task_wdt_reset();
   }
 }
 
@@ -581,18 +390,11 @@ static bool syncTime(time_t& unixNow, uint64_t& monoAtSyncMs) {
 // =========================================================
 
 static void enterDeepSleep(uint32_t seconds) {
-  DBGF("Entering deep sleep for %u min...\n", (unsigned)(seconds / 60));
-#ifdef DEBUG
   Serial.flush();
-#endif
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
-  digitalWrite(NEOPIXEL_I2C_POWER, LOW); // power down Stemma QT bus during sleep
-
-  // Advance the monotonic accumulator past this boot's runtime + the
-  // upcoming sleep duration so monotonicMs() stays continuous on wake.
+  digitalWrite(NEOPIXEL_I2C_POWER, LOW);
   persistentUs += (uint64_t)esp_timer_get_time() + (uint64_t)seconds * 1000000ULL;
-
   esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
   esp_deep_sleep_enable_gpio_wakeup(BIT(A4), ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
@@ -603,160 +405,106 @@ static void enterDeepSleep(uint32_t seconds) {
 // =========================================================
 
 void setup() {
-  DBG_BEGIN();
+  Serial.begin(115200);
   btStop();
 
   pinMode(NEOPIXEL_I2C_POWER, OUTPUT);
   digitalWrite(NEOPIXEL_I2C_POWER, HIGH);
-  delay(10);
-
-  esp_task_wdt_config_t wdtCfg = {
-    .timeout_ms    = WDT_TIMEOUT_MS,
-    .idle_core_mask = 0,
-    .trigger_panic = true,
-  };
-  esp_task_wdt_init(&wdtCfg);
-  esp_task_wdt_add(nullptr);
-  esp_task_wdt_reset();
+  delay(100);
 
   bootCount++;
-  DBGF("\n=== Boot #%u ===\n", (unsigned)bootCount);
-
-  if (!LittleFS.begin(true)) {
-    DBGLN("LittleFS mount failed");
+  if (!g_valid) {
+    g_state                  = {};
+    g_state.current_interval = INTERVAL_LADDER[0];
+    g_valid                  = true;
   }
 
-  JsonDocument state;
-  loadState(state);
+  if (!LittleFS.begin(true)) logError("LittleFS mount failed");
 
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   bool buttonWake = (cause == ESP_SLEEP_WAKEUP_GPIO);
-  DBGF("Wake reason: %s (cause=%d)\n", buttonWake ? "button press" : "timer/cold", (int)cause);
 
   Wire.begin();
-  if (!aht.begin()) {
-    logError("AHT20 init failed");
-  }
-  if (!lipo.begin()) {
-    logError("MAX17048 init failed");
-  }
+  delay(100);
+
+  if (!aht.begin())  logError("AHT20 init failed");
+  if (!lipo.begin()) logError("MAX17048 init failed");
 
   sensors_event_t humEvt, tempEvt;
   aht.getEvent(&humEvt, &tempEvt);
-  float temp     = tempEvt.temperature;
-  float humidity = humEvt.relative_humidity;
-  uint64_t monoNow = monotonicMs();
-  DBGF("Temp: %.1fC  Humidity: %.1f%%\n", temp, humidity);
-  esp_task_wdt_reset();
+  float    temp     = tempEvt.temperature;
+  float    humidity = humEvt.relative_humidity;
+  uint64_t monoNow  = monotonicMs();
 
-  // Button wake — show LED and sleep, no WiFi or logging
+  float batPct = lipo.getSOC();
+  float batV   = lipo.getVoltage();
+
   if (buttonWake) {
     setupLeds();
-    DBGLN("Showing LED status...");
     showLedStatus(humidity);
-    uint32_t s = state["current_interval"] | INTERVAL_LADDER[0];
-    enterDeepSleep(s);
+    enterDeepSleep(g_state.current_interval);
     return;
   }
 
-  // Timer wake — full cycle
   bool wifiOk = connectWifi();
-  esp_task_wdt_reset();
 
-  time_t unixNow = 0;
+  time_t   unixNow      = 0;
   uint64_t monoAtSyncMs = 0;
-  bool timeOk = false;
+  bool     timeOk       = false;
   if (wifiOk) {
     timeOk = syncTime(unixNow, monoAtSyncMs);
     if (!timeOk) wifiOk = false;
   }
-  esp_task_wdt_reset();
 
-  // Battery check (once per day)
-  float batPct = NAN, batV = NAN;
-  bool didBatteryCheck = false;
-  bool needsBatCheck = false;
-  if (state["last_battery_check"].isNull()) {
-    needsBatCheck = true;
-  } else if (timeOk) {
-    time_t last = (time_t)(uint32_t)state["last_battery_check"];
-    if ((uint32_t)(unixNow - last) >= BATTERY_CHECK_INTERVAL) needsBatCheck = true;
-  }
-  if (needsBatCheck) {
-    batPct = lipo.getSOC();
-    batV   = lipo.getVoltage();
-    DBGF("Battery: %.0f%%  Voltage: %.2fV\n", batPct, batV);
-    didBatteryCheck = true;
-    if (timeOk) state["last_battery_check"] = (uint32_t)unixNow;
-  }
+  float threshold        = getThreshold(humidity);
+  bool  significantChange = false;
+  bool  shouldLog         = false;
 
-  // Decide whether to log
-  bool hasLastHumidity = !state["last_humidity"].isNull();
-  float lastHumidity = hasLastHumidity ? (float)state["last_humidity"] : 0.0f;
-  bool hasLastLog = !state["last_log_time"].isNull();
-  time_t lastLogTime = hasLastLog ? (time_t)(uint32_t)state["last_log_time"] : 0;
-  float threshold = getThreshold(humidity);
-
-  bool significantChange = false;
-  bool shouldLog = false;
-
-  if (!hasLastHumidity) {
+  if (!g_state.has_humidity) {
     shouldLog = true;
-    DBGLN("First reading — logging");
   } else if (threshold == 0.0f) {
+    shouldLog = true; significantChange = true;
+  } else if (fabsf(humidity - g_state.last_humidity) >= threshold) {
+    shouldLog = true; significantChange = true;
+  } else if (g_state.last_log_time && timeOk && (uint32_t)((uint32_t)unixNow - g_state.last_log_time) >= 86400UL) {
     shouldLog = true;
-    significantChange = true;
-    DBGLN("Above critical — logging");
-  } else if (fabsf(humidity - lastHumidity) >= threshold) {
-    shouldLog = true;
-    significantChange = true;
-    DBGF("Delta %.1f%% >= %.1f%% — logging\n", fabsf(humidity - lastHumidity), threshold);
-  } else if (hasLastLog && timeOk && (uint32_t)(unixNow - lastLogTime) >= 86400UL) {
-    shouldLog = true;
-    DBGLN("Daily heartbeat — logging");
-  } else {
-    DBGLN("No significant change — skipping");
   }
-  esp_task_wdt_reset();
 
-  if (shouldLog || didBatteryCheck) {
+  bool logged = false;
+  if (shouldLog) {
     if (wifiOk && timeOk) {
       flushBuffer(unixNow, monoAtSyncMs);
-      bool ok = logToInflux(temp, humidity, unixNow, batPct, batV);
+      bool ok = postInflux(buildInfluxBody(temp, humidity, unixNow, batPct, batV));
       if (ok) {
-        state["last_humidity"] = humidity;
-        state["last_log_time"] = (uint32_t)unixNow;
+        logged                 = true;
+        g_state.last_humidity  = humidity;
+        g_state.has_humidity   = true;
+        g_state.last_log_time  = (uint32_t)unixNow;
       } else {
         logError("InfluxDB write failed, buffering reading");
         addToBuffer(temp, humidity, batPct, batV, monoNow);
       }
     } else {
-      DBGLN("Offline — buffering reading");
       addToBuffer(temp, humidity, batPct, batV, monoNow);
-      state["last_humidity"] = humidity;
+      g_state.last_humidity = humidity;
+      g_state.has_humidity  = true;
     }
   }
-  esp_task_wdt_reset();
 
-  // Adaptive interval
-  uint32_t sleepSeconds = updateInterval(state, humidity, significantChange);
-  DBGF("Next check in %u min (%d stable)\n",
-       (unsigned)(sleepSeconds / 60),
-       (int)(state["consecutive_stable"] | 0));
+  uint32_t sleepSeconds = updateInterval(humidity, significantChange);
 
-  // Alerts (only if online)
   if (wifiOk && timeOk) {
-    handleHumidityAlerts(humidity, unixNow, state);
-    if (didBatteryCheck && !isnan(batPct)) {
-      handleBatteryAlerts(batPct, unixNow, state);
-    }
+    handleHumidityAlerts(humidity, unixNow);
+    handleBatteryAlerts(batPct, unixNow);
   }
-  esp_task_wdt_reset();
 
-  saveState(state);
+  Serial.printf("Boot #%u | %.1fC | Hum: %.1f%% | Bat: %.0f%% %.2fV | WiFi: %s | Logged: %s | Sleep: %umin\n",
+    bootCount, temp, humidity, batPct, batV,
+    wifiOk ? "ok" : "fail",
+    logged  ? "yes" : "no",
+    (unsigned)(sleepSeconds / 60));
+
   enterDeepSleep(sleepSeconds);
 }
 
-void loop() {
-  // unused — every setup() path ends in deep sleep
-}
+void loop() {}
