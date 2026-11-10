@@ -90,7 +90,7 @@ from(bucket: "humidity")
 
 ### Monitoring the monitor
 
-A battery-powered device that goes quiet looks exactly like a healthy device with nothing to report. After a WiFi change this unit sat offline from 8/17 to 11/10 before it was noticed. The fix is an **InfluxDB deadman check**: alert (via ntfy) if no data has arrived for roughly 24 hours or more. The longest normal logging interval is 12 hours, so a 24 h+ gap means something is wrong. No RTC is needed. NTP plus buffering already covers time and gaps.
+A battery-powered device that goes quiet looks exactly like a healthy device with nothing to report. After a WiFi change, one unit sat offline for months before anyone noticed. To catch this, an **InfluxDB deadman check** alerts through ntfy when no data has arrived for roughly 24 hours or more. The longest normal logging interval is 12 hours, so a gap that long means something is wrong. No RTC is needed. NTP plus buffering already covers time and gaps.
 
 ## Building and flashing (Arduino)
 
@@ -149,7 +149,7 @@ The old version is kept in [`circuitpython/`](circuitpython/) for reference only
 
 - Arduino firmware is deployed and logging real data
 - The panel-mount button is wired in code but not yet physically installed
-- Planned: InfluxDB deadman check with ntfy notification
+- InfluxDB deadman check is set up and notifies through ntfy
 
 ## License
 
